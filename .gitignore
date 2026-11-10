@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# personal state written by the app
+progress.txt
+settings.json
+notion_config.json
+
+# separate experiment that holds a browser profile: never commit
+ums-sync/
+
+# old copies and planning scratch
+today_backup_*.py
+roadmap-plan.md
