@@ -57,7 +57,21 @@ The plan lives in `build_roadmap.py`. Edit it and run it to regenerate `roadmap.
 
 Every Java code block in the notes compiles, and the DSA functions were run against known answers.
 
-To add your own notes, drop `.md` files into a folder under `notes/`. Each folder becomes a group in the Notes view.
+## Adding notes
+
+**From an AI chat (easiest):** copy the reply with the chat's copy button, open Notes and press **Paste note** (or `Ctrl+V`). The window then:
+
+- removes chat lines such as "Sure, here is note 1" and "Say next for note 2"
+- unwraps a reply that came inside one big code block, and closes a code block left open by a cut-off reply
+- picks the title from the first `# ` line and guesses the subject from the text (change it if it's wrong, or type a new subject)
+- shows exactly where it will save, for example `notes\python\03-logging.md`, and warns about anything odd
+- saves a reply containing several notes as separate files, and asks before replacing a note with the same title
+
+**By hand:** save a `.md` file into `notes/<subject>/`. The first line `# Title` becomes the note's name and a number prefix (`01-`, `02-`) sets the order. Files saved by Notepad as UTF-8, UTF-8 with BOM or ANSI, and `.txt` files, all work.
+
+**Removing:** **Remove** moves the open note to `notes/_trash`, so nothing is ever deleted.
+
+Folders starting with `_` are ignored. A file saved straight into `notes/` shows under "Unsorted".
 
 ## Run it
 

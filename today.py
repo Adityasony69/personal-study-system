@@ -1,23 +1,26 @@
 """
 today.py - "Today's Topic": your daily NEW-skill lesson, progress tracker and dashboard.
 
-Views (sidebar, or keys 1 / 2 / 3 / 4)
+Views (sidebar, or keys 1 to 5)
   Lesson      the day's lesson cards, with Done / Skip / Undo, a focus timer, Teach me and Notes
   Dashboard   streaks, time learned, activity heatmap, progress per track, your own dates
   Roadmap     every day of the roadmap, searchable and filterable; double-click a row to open it
-  Notes       built-in study notes (Java, DSA in Java); any .md file you add under notes/ shows up too
+  Notes       study notes by subject. Paste note (Ctrl+V) saves an AI reply into the right folder;
+              Remove moves a note to notes/_trash
+  Daily Topic one new thing a day to research and think about, with a timer and your own research notes
 
 Keyboard
   Left / Right  previous / next day        T  jump to today
   D  Done    S  Skip    U  Undo            L  Teach me    N  Notes
   Space  start / pause the focus timer     Ctrl+F or /  search (roadmap, or notes when open)
-  1-4    switch view                       ?  show this list
+  1-5    switch view                       ?  show this list
 
 Everything is logged in progress.txt (append-only history). If Notion is connected
 (run notion_setup.py once), every Done/Skip/Undo is also synced there.
 """
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -26,6 +29,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.parse
 import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -34,6 +38,7 @@ from tkinter import messagebox, ttk
 HERE = Path(__file__).resolve().parent
 HUB = HERE.parent
 sys.path.insert(0, str(HERE))
+import notes_lib as nl  # noqa: E402
 import notion_sync as ns  # noqa: E402
 
 ROADMAP = HERE / "roadmap.json"
@@ -42,7 +47,15 @@ LINKS = HERE / "notion_links.json"
 SETTINGS = HERE / "settings.json"
 EVENTS = HERE / "my-events.txt"
 NOTES = HERE / "notes"
-NOTE_GROUPS = {"java": "Java", "dsa-java": "DSA in Java"}
+NOTE_GROUPS = {"iot": "IoT with ESP32", "os": "Operating systems in practice", "dbms": "Databases in practice",
+               "networks": "Networking in practice", "cloud": "Cloud in practice", "python": "Python",
+               "java": "Java", "dsa-java": "DSA in Java", "git": "Git", "sql": "SQL",
+               "numpy-pandas": "NumPy and Pandas", "machine-learning": "Machine Learning",
+               "deep-learning": "Deep Learning", "genai": "GenAI", "deployment": "Deployment", "career": "Career",
+               "os-exam": "OS exam theory (units 1 to 5)", "research": "My research"}
+TOPICS = HERE / "daily_topics.json"
+TOPIC_LOG = HERE / "topic_log.txt"
+TOPIC_START = date(2026, 11, 1)
 APP_NAME = "Today's Topic"
 
 THEMES = {
@@ -143,24 +156,30 @@ def load_events():
 
 
 def load_notes():
-    """[(group title, [(note title, path), ...]), ...] from notes/<folder>/*.md"""
+    """[(group title, [(note title, path), ...]), ...]; see notes_lib for the folder rules."""
+    return nl.load_notes(NOTES, NOTE_GROUPS)
+
+
+def load_topics():
+    """[(niche id, niche label, [(title, what it is, question), ...]), ...] from daily_topics.json"""
+    try:
+        data = json.loads(TOPICS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [(n["id"], n["label"], [tuple(t) for t in n["topics"] if len(t) == 3])
+            for n in data.get("niches", []) if n.get("topics")]
+
+
+def topic_log():
+    """[(day, niche, title), ...] of topics marked as researched, oldest first."""
     out = []
-    if NOTES.is_dir():
-        known = list(NOTE_GROUPS)
-        folders = [d for d in NOTES.iterdir() if d.is_dir()]
-        for folder in sorted(folders, key=lambda d: (known.index(d.name) if d.name in known else 99, d.name)):
-            items = []
-            for path in sorted(folder.glob("*.md")):
-                title = path.stem
-                try:
-                    first = path.read_text(encoding="utf-8").lstrip().splitlines()[0]
-                    if first.startswith("# "):
-                        title = first[2:].strip()
-                except (OSError, IndexError):
-                    pass
-                items.append((title, path))
-            if items:
-                out.append((NOTE_GROUPS.get(folder.name, folder.name.replace("-", " ").title()), items))
+    try:
+        for line in TOPIC_LOG.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3 and not line.startswith("#"):
+                out.append((parts[0][:10], parts[1], parts[2]))
+    except OSError:
+        pass
     return out
 
 
@@ -302,6 +321,14 @@ class App:
         self.timer = dict(total=0, left=0, end=0, running=False, label="")
         self.search_text, self.f_track, self.f_status = "", "All tracks", "All"
         self.note_path, self.note_query, self.note_tree = None, "", None
+        self.notes_flash, self.paste_win = "", None
+        self.topics = load_topics()
+        self.topic = None                     # None = show the topic of the day
+        self.topic_niche = self.settings.get("topic_niche", "all")
+        try:
+            self.topic_minutes = max(5, min(60, int(self.settings.get("topic_minutes", 15))))
+        except (TypeError, ValueError):
+            self.topic_minutes = 15
         self.scroll = self.tree = self.sync_label = None
         self.sync_msg = ("Notion: notes + progress sync on" if ns.ready()
                          else "Notes open in Notion · progress is saved in progress.txt")
@@ -401,7 +428,7 @@ class App:
         main = tk.Frame(self.root, bg=T["bg"])
         main.pack(side="left", fill="both", expand=True)
         {"today": self.view_today, "dash": self.view_dash, "roadmap": self.view_roadmap,
-         "notes": self.view_notes}[self.view](main)
+         "notes": self.view_notes, "topic": self.view_topic}[self.view](main)
         title_bar(self.root, self.theme == "dark")
 
     def style(self):
@@ -429,7 +456,7 @@ class App:
         tk.Label(side, text="Daily learning companion", bg=bg, fg=T["muted"], font=("Segoe UI", 9)).pack(
             anchor="w", padx=pad, pady=(0, px(14)))
         for key, text, hint in (("today", "Lesson", "1"), ("dash", "Dashboard", "2"), ("roadmap", "Roadmap", "3"),
-                                ("notes", "Notes", "4")):
+                                ("notes", "Notes", "4"), ("topic", "Daily Topic", "5")):
             active = key == self.view
             rbg = T["card2"] if active else bg
             row = tk.Frame(side, bg=rbg, cursor="hand2")
@@ -560,6 +587,16 @@ class App:
             RButton(row, "Skip", lambda: self.mark("SKIP", e), T["card2"], T["fg"]).pack(side="left", padx=(0, px(8)))
         if s:
             RButton(row, "Undo", lambda: self.mark("UNDO", e), T["card2"], T["warn"]).pack(side="left")
+        daily = self.daily_topic()
+        if daily:
+            c = Card(f, T["card"], pad=12, radius=12)
+            c.pack(fill="x", padx=side_pad, pady=(px(10), px(4)))
+            RButton(c.body, "Open", lambda: self.topic_today(), T["card2"], T["fg"], size=9, bold=False, padx=11,
+                    pady=5).pack(side="right")
+            tk.Label(c.body, text="DAILY TOPIC", bg=T["card"], fg=T["muted"], font=("Segoe UI Semibold", 8)).pack(
+                side="left", padx=(0, px(12)))
+            wlabel(c.body, text=daily[1], bg=T["card"], fg=T["fg"], font=("Segoe UI", 10)).pack(
+                side="left", fill="x", expand=True)
         self.sync_label = tk.Label(f, text=self.sync_msg, bg=T["bg"], fg=T["muted"], font=("Segoe UI", 9))
         self.sync_label.pack(anchor="w", padx=side_pad, pady=(px(4), px(18)))
 
@@ -820,8 +857,15 @@ class App:
         head = tk.Frame(main, bg=T["bg"])
         head.pack(fill="x", padx=P, pady=(px(18), px(10)))
         tk.Label(head, text="Notes", bg=T["bg"], fg=T["fg"], font=("Segoe UI Semibold", 20)).pack(side="left")
-        RButton(head, "Open file", self.open_note_file, T["card2"], T["fg"], size=9, bold=False, padx=11, pady=5).pack(
+        if self.notes_flash:
+            tk.Label(head, text=self.notes_flash, bg=T["bg"], fg=T["ok"], font=("Segoe UI", 10)).pack(
+                side="left", padx=px(14))
+        RButton(head, "Remove", self.remove_note, T["card2"], T["muted"], size=9, bold=False, padx=11, pady=5).pack(
             side="right")
+        RButton(head, "Open file", self.open_note_file, T["card2"], T["fg"], size=9, bold=False, padx=11, pady=5).pack(
+            side="right", padx=(0, px(8)))
+        RButton(head, "Paste note", self.paste_note, T["accent"], size=9, padx=12, pady=5).pack(
+            side="right", padx=(0, px(8)))
         self.note_var = tk.StringVar(value=self.note_query)
         self.search_entry = tk.Entry(head, textvariable=self.note_var, bg=T["card"], fg=T["fg"], width=24,
                                      insertbackground=T["fg"], relief="flat", font=("Segoe UI", 10),
@@ -861,6 +905,8 @@ class App:
         txt.tag_configure("h3", font=("Segoe UI Semibold", 11), spacing1=px(10), spacing3=px(3))
         txt.tag_configure("bold", font=("Segoe UI Semibold", 11))
         txt.tag_configure("bullet", lmargin1=px(14), lmargin2=px(30))
+        txt.tag_configure("bullet2", lmargin1=px(34), lmargin2=px(50))
+        txt.tag_configure("quote", lmargin1=px(18), lmargin2=px(18), foreground=T["muted"])
         txt.tag_configure("code", font=mono, background=T["card2"], lmargin1=px(12), lmargin2=px(12), spacing1=0,
                           spacing3=0, wrap="none")
         txt.tag_configure("icode", font=mono, background=T["card2"])
@@ -876,31 +922,33 @@ class App:
         self.note_query = self.note_var.get().strip()
         words = self.note_query.lower().split()
         tree.delete(*tree.get_children())
-        paths = []
-        for gi, (group, items) in enumerate(load_notes()):
+        groups, paths = [], []
+        for group, items in load_notes():
             keep = []
             for title, path in items:
                 if words:
                     try:
-                        hay = (title + " " + path.read_text(encoding="utf-8")).lower()
+                        hay = (title + " " + nl.read_note(path)).lower()
                     except OSError:
                         continue
                     if not all(w in hay for w in words):
                         continue
                 keep.append((title, path))
             if keep:
-                gid = f"group{gi}"
-                tree.insert("", "end", iid=gid, text=group.upper(), open=True, tags=("group",))
-                for title, path in keep:
-                    tree.insert(gid, "end", iid=str(path), text=title)
-                    paths.append(path)
+                groups.append((group, keep))
+                paths += [path for _, path in keep]
         if not paths:
             self.show_note(None)
             return
         pick = self.note_path if self.note_path in paths else paths[0]
+        for gi, (group, keep) in enumerate(groups):
+            gid = f"group{gi}"
+            is_open = bool(words) or pick in [path for _, path in keep]
+            tree.insert("", "end", iid=gid, text=f"{group.upper()}  ({len(keep)})", open=is_open, tags=("group",))
+            for title, path in keep:
+                tree.insert(gid, "end", iid=str(path), text=title)
         tree.selection_set(str(pick))
-        if pick != paths[0]:                 # leave the list at the top when the first note is the one open
-            tree.after_idle(lambda: tree.exists(str(pick)) and tree.see(str(pick)))
+        tree.after_idle(lambda: tree.exists(str(pick)) and tree.see(str(pick)))
         self.show_note(pick)
 
     def note_selected(self, _ev=None):
@@ -919,10 +967,11 @@ class App:
         txt.delete("1.0", "end")
         self.note_path = path
         if path is None:
-            txt.insert("end", "No notes match.\n\nAdd .md files under the notes folder and they will appear here.")
+            txt.insert("end", "No notes match.\n\nPress Paste note (or Ctrl+V) to add one from an AI reply, "
+                              "or save .md files into a subject folder under notes.")
         else:
             try:
-                self.render_md(txt, path.read_text(encoding="utf-8"))
+                self.render_md(txt, nl.read_note(path))
             except OSError as exc:
                 txt.insert("end", f"Couldn't read this note: {exc}")
             for word in self.note_query.lower().split():
@@ -941,6 +990,7 @@ class App:
     def render_md(txt, md):
         """Small Markdown renderer: headings, bullets, code blocks, tables, `code` and **bold**."""
         def inline(text, *tags):
+            text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r"\1 (\2)", text)   # [label](url) -> label (url)
             for part in re.split(r"(`[^`]+`|\*\*[^*]+\*\*)", text):
                 if part.startswith("`") and part.endswith("`") and len(part) > 2:
                     txt.insert("end", part[1:-1], tags + ("icode",))
@@ -965,33 +1015,555 @@ class App:
 
         code, table = False, []
         for line in md.splitlines():
-            if line.strip().startswith("```"):
+            if line.strip().startswith(("```", "~~~")):
                 flush(table)
                 table, code = [], not code
                 continue
             if code:
                 txt.insert("end", line + "\n", ("code",))
                 continue
-            if line.startswith("|"):
+            if line.lstrip().startswith("|"):
                 cells = re.split(r"(?<!\\)\|", line.strip().strip("|"))   # \| is a literal bar inside a cell
                 table.append([c.strip().replace("\\|", "|") for c in cells])
                 continue
             flush(table)
             table = []
-            if line.startswith("### "):
-                txt.insert("end", line[4:] + "\n", ("h3",))
-            elif line.startswith("## "):
-                txt.insert("end", line[3:] + "\n", ("h2",))
-            elif line.startswith("# "):
-                txt.insert("end", line[2:] + "\n", ("h1",))
-            elif line.startswith(("- ", "* ")):
-                txt.insert("end", "\u2022  ", ("bullet",))
-                inline(line[2:], "bullet")
-                txt.insert("end", "\n", ("bullet",))
+            heading = re.match(r"^(#{1,6})[ \t]+(.+?)[ \t#]*$", line)
+            bullet = re.match(r"^([ \t]*)[-*+][ \t]+(.*)$", line)
+            number = re.match(r"^([ \t]*)(\d+[.)])[ \t]+(.*)$", line)
+            if heading:
+                level = min(len(heading.group(1)), 3)
+                txt.insert("end", re.sub(r"\*\*|__|`", "", heading.group(2)) + "\n", ("h%d" % level,))
+            elif re.fullmatch(r"[ \t]*(-{3,}|\*{3,}|_{3,})[ \t]*", line):
+                txt.insert("end", "\n")
+            elif bullet:
+                tag = "bullet2" if len(bullet.group(1).expandtabs(4)) >= 2 else "bullet"
+                txt.insert("end", "\u2022  ", (tag,))
+                inline(bullet.group(2), tag)
+                txt.insert("end", "\n", (tag,))
+            elif number:
+                tag = "bullet2" if len(number.group(1).expandtabs(4)) >= 2 else "bullet"
+                txt.insert("end", number.group(2) + "  ", (tag,))
+                inline(number.group(3), tag)
+                txt.insert("end", "\n", (tag,))
+            elif line.lstrip().startswith(">"):
+                inline(line.lstrip()[1:].lstrip(), "quote")
+                txt.insert("end", "\n", ("quote",))
             else:
                 inline(line)
                 txt.insert("end", "\n")
         flush(table)
+
+    # ---------- adding and removing notes ----------
+    def flash(self, message, seconds=8):
+        """Show a short message next to the Notes title, then clear it."""
+        self.notes_flash = message
+
+        def clear():
+            if self.notes_flash == message:
+                self.notes_flash = ""
+                if self.view == "notes":
+                    self.render()
+        self.root.after(seconds * 1000, clear)
+
+    def remove_note(self):
+        path = self.note_path
+        if not path or not path.exists():
+            messagebox.showinfo("Remove note", "Pick a note in the list first.")
+            return
+        title = nl.note_title(path)
+        if not messagebox.askyesno("Remove note", f"Move '{title}' to the trash?\n\n"
+                                   "It goes to notes\\_trash, so you can move it back later."):
+            return
+        trash = NOTES / "_trash"
+        trash.mkdir(parents=True, exist_ok=True)
+        subject = path.parent.name if path.parent != NOTES else "unsorted"
+        target = trash / f"{subject}__{path.name}"
+        if target.exists():
+            target = trash / f"{subject}__{datetime.now():%Y%m%d-%H%M%S}__{path.name}"
+        try:
+            shutil.move(str(path), str(target))
+        except OSError as exc:
+            messagebox.showerror("Remove note", f"Couldn't move it: {exc}")
+            return
+        self.note_path = None
+        self.flash(f"Moved '{title}' to the trash")
+        self.render()
+
+    def paste_note(self):
+        """Window that takes an AI reply from the clipboard, tidies it and saves it in the right folder."""
+        if self.paste_win is not None and self.paste_win.winfo_exists():
+            self.paste_win.deiconify()
+            self.paste_win.lift()
+            return
+        T = self.T
+        dlg = self.paste_win = tk.Toplevel(self.root)
+        dlg.title("Paste a note")
+        dlg.configure(bg=T["bg"])
+        dlg.transient(self.root)
+        w = min(px(920), self.root.winfo_screenwidth() - 60)
+        h = min(px(720), self.root.winfo_screenheight() - 100)
+        dlg.geometry(f"{w}x{h}+{self.root.winfo_rootx() + px(40)}+{max(0, self.root.winfo_rooty() - px(10))}")
+        dlg.minsize(min(w, px(640)), min(h, px(480)))
+        title_bar(dlg, self.theme == "dark")
+
+        subjects = nl.subjects(NOTES, NOTE_GROUPS)
+        labels = dict(subjects)
+        current = self.note_path.parent.name if self.note_path and self.note_path.parent != NOTES else ""
+        start = self.settings.get("paste_subject") or current or "python"
+        state = {"subject": start, "warnings": [], "auto_title": "", "job": None, "guessed": False}
+        pad = px(18)
+
+        frame = tk.Frame(dlg, bg=T["bg"])
+        frame.pack(fill="both", expand=True, padx=pad, pady=pad)
+        frame.columnconfigure(1, weight=1)
+        tk.Label(frame, text="Paste a note", bg=T["bg"], fg=T["fg"], font=("Segoe UI Semibold", 16)).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        tk.Label(frame, text="Copy the AI's reply with the copy button under it, then check it here and press Save.",
+                 bg=T["bg"], fg=T["muted"], font=("Segoe UI", 10)).grid(row=1, column=0, columnspan=3, sticky="w",
+                                                                        pady=(0, px(12)))
+
+        def field_label(row, text):
+            tk.Label(frame, text=text, bg=T["bg"], fg=T["muted"], font=("Segoe UI", 10)).grid(
+                row=row, column=0, sticky="w", padx=(0, px(12)), pady=px(4))
+
+        def entry(parent, var, width):
+            return tk.Entry(parent, textvariable=var, bg=T["card"], fg=T["fg"], insertbackground=T["fg"],
+                            relief="flat", font=("Segoe UI", 10), width=width, highlightthickness=1,
+                            highlightbackground=T["line"], highlightcolor=T["accent"])
+
+        field_label(2, "Subject")
+        srow = tk.Frame(frame, bg=T["bg"])
+        srow.grid(row=2, column=1, columnspan=2, sticky="w")
+        mb = tk.Menubutton(srow, text="", bg=T["card2"], fg=T["fg"], activebackground=T["line"],
+                           activeforeground=T["fg"], relief="flat", bd=0, highlightthickness=0,
+                           font=("Segoe UI", 10), padx=px(12), pady=px(4), cursor="hand2", width=26, anchor="w")
+        menu = tk.Menu(mb, tearoff=0, bg=T["card"], fg=T["fg"], activebackground=T["accent"],
+                       activeforeground="#ffffff", bd=0, font=("Segoe UI", 10))
+        mb.configure(menu=menu)
+        mb.pack(side="left")
+        tk.Label(srow, text="or a new subject", bg=T["bg"], fg=T["muted"], font=("Segoe UI", 10)).pack(
+            side="left", padx=(px(14), px(8)))
+        new_var = tk.StringVar()
+        entry(srow, new_var, 22).pack(side="left", ipady=px(3))
+        hint = tk.Label(frame, text="", bg=T["bg"], fg=T["muted"], font=("Segoe UI", 9))
+        hint.grid(row=3, column=1, columnspan=2, sticky="w")
+
+        field_label(4, "Title")
+        title_var = tk.StringVar()
+        title_entry = entry(frame, title_var, 50)
+        title_entry.grid(row=4, column=1, columnspan=2, sticky="ew", ipady=px(3))
+
+        where = tk.Label(frame, text="", bg=T["bg"], fg=T["ok"], font=("Segoe UI", 10), anchor="w", justify="left")
+        where.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(px(8), 0))
+        warn = tk.Label(frame, text="", bg=T["bg"], fg=T["warn"], font=("Segoe UI", 10), anchor="w", justify="left")
+        warn.grid(row=6, column=0, columnspan=3, sticky="ew")
+        warn.bind("<Configure>", lambda e: warn.configure(wraplength=max(200, e.width - 8)))
+
+        boxf = tk.Frame(frame, bg=T["bg"])
+        boxf.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(px(8), px(10)))
+        frame.rowconfigure(7, weight=1)
+        box = tk.Text(boxf, bg=T["card"], fg=T["fg"], insertbackground=T["fg"], font=("Consolas", 10),
+                      wrap="word", relief="flat", bd=0, highlightthickness=1, highlightbackground=T["line"],
+                      highlightcolor=T["accent"], padx=px(12), pady=px(10), undo=True)
+        sb = ttk.Scrollbar(boxf, orient="vertical", command=box.yview, style="App.Vertical.TScrollbar")
+        box.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        box.pack(side="left", fill="both", expand=True)
+
+        buttons = tk.Frame(frame, bg=T["bg"])
+        buttons.grid(row=8, column=0, columnspan=3, sticky="ew")
+
+        def folder_name():
+            typed = new_var.get().strip()
+            return nl.slugify(typed, 40) if typed else state["subject"]
+
+        def compute():
+            text = box.get("1.0", "end-1c")
+            folder = NOTES / folder_name()
+            parts = nl.split_notes(text)
+            titles = []
+            for i, part in enumerate(parts):
+                found = nl.title_of(part)
+                if len(parts) == 1 or (found is None and i == 0):
+                    typed = title_var.get().strip()
+                    found = nl.clean_title(typed) if typed else found
+                titles.append(found or "")
+            return text, folder, parts, titles
+
+        def refresh():
+            state["job"] = None
+            if not dlg.winfo_exists():
+                return
+            text, folder, parts, titles = compute()
+            mb.configure(text="  " + labels.get(state["subject"], nl.group_label(state["subject"], NOTE_GROUPS))
+                         + "  \u25be")
+            if new_var.get().strip():
+                hint.configure(text=f"New subject: it will be created as notes\\{folder.name}")
+            elif state["guessed"]:
+                hint.configure(text="Subject guessed from the text. Change it if it's wrong.")
+            else:
+                hint.configure(text="")
+            problems = list(state["warnings"])
+            if not text.strip():
+                problems = ["Nothing to save yet. Press Paste from clipboard, or paste into the box (Ctrl+V)."]
+            elif not all(titles):
+                problems.insert(0, "Type a title for this note.")
+            existing = nl.existing_titles(folder)
+            for t in titles:
+                if t and t.lower() in existing:
+                    problems.append(f"'{t}' is already saved in this subject; Save will ask whether to replace it.")
+            if len(parts) > 1:
+                problems.insert(0, f"This contains {len(parts)} notes; each will be saved as its own file.")
+            if text.strip() and all(titles):
+                paths = nl.plan_paths(folder, titles)
+                shown = ", ".join(p.name for p in paths[:3]) + (f" and {len(paths) - 3} more" if len(paths) > 3 else "")
+                where.configure(text=f"Will save to  notes\\{folder.name}\\  as  {shown}", fg=T["ok"])
+            else:
+                where.configure(text="")
+            warn.configure(text="\n".join("\u2022 " + x for x in problems))
+
+        def schedule(*_):
+            if state["job"] is not None:
+                dlg.after_cancel(state["job"])
+            state["job"] = dlg.after(250, refresh)
+
+        def sync_title():
+            """Keep the Title box in step with the '# ' line until the person types their own."""
+            found = nl.title_of(box.get("1.0", "end-1c"))
+            if found and (not title_var.get().strip() or title_var.get() == state["auto_title"]):
+                title_var.set(found)
+                state["auto_title"] = found
+
+        def load_text(raw):
+            text, warnings = nl.clean_pasted(raw)
+            state["warnings"] = warnings
+            guess = nl.guess_subject(text) if text.strip() else None
+            if guess and not new_var.get().strip():
+                state["subject"], state["guessed"] = guess, True
+            else:
+                state["guessed"] = False
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            box.edit_reset()
+            title_var.set("")
+            state["auto_title"] = ""
+            sync_title()
+            box.mark_set("insert", "1.0")
+            box.see("1.0")
+            schedule()
+
+        def from_clipboard():
+            try:
+                raw = self.root.clipboard_get()
+            except tk.TclError:
+                raw = ""
+            load_text(raw)
+
+        def tidy():
+            load_text(box.get("1.0", "end-1c"))
+
+        def choose(name):
+            state["subject"], state["guessed"] = name, False
+            new_var.set("")
+            schedule()
+
+        for name, label in subjects:
+            menu.add_command(label=label, command=lambda n=name: choose(n))
+
+        def on_modified(_e=None):
+            if box.edit_modified():
+                box.edit_modified(False)
+                state["warnings"] = [x for x in state["warnings"] if "empty" not in x]
+                sync_title()
+                schedule()
+
+        def on_paste(_e=None):
+            if not box.get("1.0", "end-1c").strip():
+                try:
+                    raw = self.root.clipboard_get()
+                except tk.TclError:
+                    return None
+                load_text(raw)
+                return "break"
+            return None
+
+        def save(_e=None):
+            text, folder, parts, titles = compute()
+            if not text.strip():
+                dlg.bell()
+                return "break"
+            if not all(titles):
+                messagebox.showwarning("Paste a note", "Type a title for the note first.", parent=dlg)
+                title_entry.focus_set()
+                return "break"
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("Paste a note", f"Couldn't create the folder: {exc}", parent=dlg)
+                return "break"
+            existing = nl.existing_titles(folder)
+            planned = nl.plan_paths(folder, titles)
+            saved = []
+            for part, title, path in zip(parts, titles, planned):
+                target = path
+                old = existing.get(title.lower())
+                if old is not None:
+                    answer = messagebox.askyesnocancel(
+                        "Note already exists", f"'{title}' is already saved as {old.name}.\n\n"
+                        "Yes: replace it with this one\nNo: keep both\nCancel: stop here", parent=dlg)
+                    if answer is None:
+                        break
+                    if answer:
+                        target = old
+                body = nl.set_title(part, title).strip() + "\n"
+                try:
+                    target.write_bytes(body.encode("utf-8"))
+                except OSError as exc:
+                    messagebox.showerror("Paste a note", f"Couldn't save {target.name}: {exc}", parent=dlg)
+                    break
+                saved.append(target)
+            if not saved:
+                return "break"
+            self.settings["paste_subject"] = folder.name
+            self.save_settings()
+            close()
+            self.note_query, self.note_path = "", saved[-1]
+            count = f"{len(saved)} notes" if len(saved) > 1 else f"'{titles[0]}'"
+            self.flash(f"Saved {count} in {nl.group_label(folder.name, NOTE_GROUPS)}")
+            self.view = "notes"
+            self.render()
+            return "break"
+
+        def close(_e=None):
+            if state["job"] is not None:
+                dlg.after_cancel(state["job"])
+                state["job"] = None
+            self.paste_win = None
+            dlg.destroy()
+
+        RButton(buttons, "Paste from clipboard", from_clipboard, T["card2"], T["fg"], size=9, padx=12, pady=6).pack(
+            side="left")
+        RButton(buttons, "Tidy text", tidy, T["card2"], T["fg"], size=9, bold=False, padx=12, pady=6).pack(
+            side="left", padx=px(8))
+        RButton(buttons, "Save note", save, T["ok"], size=10, padx=18, pady=6).pack(side="right")
+        RButton(buttons, "Cancel", close, T["card2"], T["fg"], size=10, bold=False, padx=14, pady=6).pack(
+            side="right", padx=px(8))
+
+        box.bind("<<Modified>>", on_modified)
+        box.bind("<<Paste>>", on_paste)
+        title_var.trace_add("write", schedule)
+        new_var.trace_add("write", schedule)
+        dlg.bind("<Escape>", close)
+        dlg.bind("<Control-s>", save)
+        dlg.bind("<Control-Return>", save)
+        dlg.protocol("WM_DELETE_WINDOW", close)
+        self.paste_ui = dict(box=box, title=title_var, new=new_var, where=where, warn=warn, save=save, hint=hint,
+                             state=state,
+                             choose=choose, close=close, refresh=refresh, load=load_text)
+        from_clipboard()
+        box.focus_set()
+
+    # ---------- daily topic ----------
+    def save_settings(self):
+        try:
+            SETTINGS.write_text(json.dumps(self.settings, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+
+    def topic_pool(self):
+        """[(niche label, title, what it is, question), ...] for the chosen niche."""
+        return [(label, *t) for nid, label, items in self.topics for t in items
+                if self.topic_niche in ("all", nid)]
+
+    def daily_topic(self):
+        """Same topic all day, a new one tomorrow, no repeats until the pool runs out."""
+        pool = self.topic_pool()
+        if not pool:
+            return None
+        order = list(range(len(pool)))
+        random.Random(20261101).shuffle(order)
+        return pool[order[(date.today() - TOPIC_START).days % len(pool)]]
+
+    def view_topic(self, main):
+        T, P = self.T, px(26)
+        sc = self.scroll = Scroll(main, T["bg"])
+        sc.pack(fill="both", expand=True)
+        f = sc.inner
+        side_pad = (P, px(12))
+        log = topic_log()
+        days = {d for d, _, _ in log}
+        streak, d = 0, date.today()
+        if d.isoformat() not in days:
+            d -= timedelta(days=1)
+        while d.isoformat() in days:
+            streak += 1
+            d -= timedelta(days=1)
+
+        head = tk.Frame(f, bg=T["bg"])
+        head.pack(fill="x", padx=side_pad, pady=(px(18), 0))
+        tk.Label(head, text="Daily Topic", bg=T["bg"], fg=T["fg"], font=("Segoe UI Semibold", 20)).pack(side="left")
+        tk.Label(head, text=f"{len(log)} researched  ·  {streak}-day streak", bg=T["bg"], fg=T["muted"],
+                 font=("Segoe UI", 10)).pack(side="right")
+        tk.Label(f, text="One new thing a day to research and think about.", bg=T["bg"], fg=T["muted"],
+                 font=("Segoe UI", 10)).pack(anchor="w", padx=side_pad)
+
+        daily = self.daily_topic()
+        topic = self.topic or daily
+        bar = tk.Frame(f, bg=T["bg"])
+        bar.pack(fill="x", padx=side_pad, pady=(px(12), px(8)))
+        labels = {"all": "All niches"}
+        labels.update({nid: label for nid, label, _ in self.topics})
+        mb = tk.Menubutton(bar, text=labels.get(self.topic_niche, "All niches") + "  ▾", bg=T["card2"], fg=T["fg"],
+                           activebackground=T["line"], activeforeground=T["fg"], relief="flat", bd=0,
+                           highlightthickness=0, font=("Segoe UI", 10), padx=px(12), pady=px(5), cursor="hand2")
+        menu = tk.Menu(mb, tearoff=0, bg=T["card"], fg=T["fg"], activebackground=T["accent"],
+                       activeforeground="#ffffff", bd=0, font=("Segoe UI", 10))
+        for nid, label in labels.items():
+            menu.add_command(label=label, command=lambda n=nid: self.topic_set_niche(n))
+        mb.configure(menu=menu)
+        mb.pack(side="left")
+        RButton(bar, "Spin another", self.topic_spin, T["accent"], size=9, padx=12, pady=5).pack(side="left", padx=px(8))
+        if topic != daily:
+            RButton(bar, "Back to today's topic", self.topic_today, T["card2"], T["fg"], size=9, bold=False, padx=12,
+                    pady=5).pack(side="left")
+        if not topic:
+            tk.Label(f, text="No topics found. Check daily_topics.json.", bg=T["bg"], fg=T["warn"],
+                     font=("Segoe UI", 10)).pack(anchor="w", padx=side_pad, pady=px(20))
+            return
+        niche, title, brief, question = topic
+        done = any(t == title for _, _, t in log)
+
+        c = Card(f, T["card"], pad=20)
+        c.pack(fill="x", padx=side_pad, pady=px(6))
+        top = tk.Frame(c.body, bg=T["card"])
+        top.pack(fill="x")
+        self.pill(top, niche, T["accent"]).pack(side="left")
+        tag = f"Topic of the day  ·  {date.today():%a %d %b}" if topic == daily else "Random pick"
+        tk.Label(top, text=tag, bg=T["card"], fg=T["muted"], font=("Segoe UI", 9)).pack(side="left", padx=px(10))
+        if done:
+            self.pill(top, "Researched ✓", T["ok"]).pack(side="right")
+        wlabel(c.body, text=title, bg=T["card"], fg=T["fg"], font=("Segoe UI Semibold", 22)).pack(
+            fill="x", pady=(px(12), px(4)))
+        wlabel(c.body, text=brief, bg=T["card"], fg=T["fg"], font=("Segoe UI", 12)).pack(fill="x")
+        tk.Label(c.body, text="THINK ABOUT", bg=T["card"], fg=T["muted"], font=("Segoe UI Semibold", 8)).pack(
+            anchor="w", pady=(px(14), 0))
+        wlabel(c.body, text=question, bg=T["card"], fg=T["fg"], font=("Segoe UI", 11)).pack(fill="x")
+
+        c = Card(f, T["card"])
+        c.pack(fill="x", padx=side_pad, pady=px(6))
+        row = tk.Frame(c.body, bg=T["card"])
+        row.pack(fill="x")
+        tk.Label(row, text="Research timer", bg=T["card"], fg=T["fg"], font=("Segoe UI Semibold", 11)).pack(side="left")
+        RButton(row, "Start timer", self.topic_timer, T["accent"], size=9, padx=12, pady=5).pack(side="right")
+        RButton(row, "+", lambda: self.topic_minutes_change(5), T["card2"], T["fg"], size=9, padx=9, pady=5).pack(
+            side="right", padx=(0, px(10)))
+        tk.Label(row, text=f"{self.topic_minutes} min", bg=T["card"], fg=T["fg"], font=("Segoe UI Semibold", 11),
+                 width=7).pack(side="right")
+        RButton(row, "−", lambda: self.topic_minutes_change(-5), T["card2"], T["fg"], size=9, padx=9, pady=5).pack(
+            side="right")
+        row = tk.Frame(c.body, bg=T["card"])
+        row.pack(fill="x", pady=(px(12), 0))
+        RButton(row, "Search the web", lambda: self.topic_web(title), T["card2"], T["fg"], size=9, padx=12,
+                pady=5).pack(side="left", padx=(0, px(8)))
+        RButton(row, "Ask Claude", lambda: self.topic_claude(topic), T["purple"], size=9, padx=12, pady=5).pack(
+            side="left", padx=(0, px(8)))
+        RButton(row, "My notes", lambda: self.topic_notes(topic), T["card2"], T["fg"], size=9, padx=12, pady=5).pack(
+            side="left")
+        if not done:
+            RButton(row, "Mark researched ✓", lambda: self.topic_mark(topic), T["ok"], size=9, padx=12, pady=5).pack(
+                side="right")
+        tk.Label(c.body, text="HOW TO RESEARCH IT", bg=T["card"], fg=T["muted"], font=("Segoe UI Semibold", 8)).pack(
+            anchor="w", pady=(px(14), px(2)))
+        for step in ("1.  What is it? Write it in two sentences of your own.",
+                     "2.  Find one real example.",
+                     "3.  Find the strongest argument against it.",
+                     "4.  Write your own view in My notes."):
+            tk.Label(c.body, text=step, bg=T["card"], fg=T["fg"], font=("Segoe UI", 10)).pack(anchor="w")
+
+        if log:
+            c = Card(f, T["card"])
+            c.pack(fill="x", padx=side_pad, pady=(px(6), px(20)))
+            tk.Label(c.body, text="Recently researched", bg=T["card"], fg=T["fg"], font=("Segoe UI Semibold", 12)).pack(
+                anchor="w")
+            for day, n, t in reversed(log[-6:]):
+                r = tk.Frame(c.body, bg=T["card"])
+                r.pack(fill="x", pady=(px(5), 0))
+                tk.Label(r, text=f"{date.fromisoformat(day):%d %b}", bg=T["card"], fg=T["muted"], font=("Segoe UI", 10),
+                         width=8, anchor="w").pack(side="left")
+                tk.Label(r, text=t, bg=T["card"], fg=T["fg"], font=("Segoe UI", 10)).pack(side="left")
+                tk.Label(r, text=n, bg=T["card"], fg=T["muted"], font=("Segoe UI", 9)).pack(side="right")
+
+    def topic_today(self):
+        self.topic, self.view = None, "topic"
+        self.render()
+
+    def topic_spin(self):
+        pool = self.topic_pool()
+        current = self.topic or self.daily_topic()
+        others = [t for t in pool if t != current]
+        if others:
+            self.topic = random.choice(others)
+            self.render()
+
+    def topic_set_niche(self, niche):
+        self.topic_niche, self.topic = niche, None
+        self.settings["topic_niche"] = niche
+        self.save_settings()
+        self.render()
+
+    def topic_minutes_change(self, delta):
+        self.topic_minutes = max(5, min(60, self.topic_minutes + delta))
+        self.settings["topic_minutes"] = self.topic_minutes
+        self.save_settings()
+        self.render()
+
+    def topic_timer(self):
+        topic = self.topic or self.daily_topic()
+        if topic:
+            self.start_timer({"minutes": self.topic_minutes, "label": "Research: " + topic[1]})
+
+    def topic_web(self, title):
+        webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote_plus(title + " explained"))
+
+    def topic_claude(self, topic):
+        niche, title, brief, question = topic
+        self.launch_claude(f"Help me research today's topic. Topic - {title} ({niche}). Summary - {brief} "
+                           f"Question to think about - {question} "
+                           "Explain it in plain simple language, give one real example and the strongest argument "
+                           "against it, then ask me for my own view and push back on it.", "Ask Claude")
+
+    def topic_notes(self, topic):
+        niche, title, brief, question = topic
+        folder = NOTES / "research"
+        folder.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60]
+        path = folder / f"{slug}.md"
+        if not path.exists():
+            path.write_text(f"# {title}\n\n{niche}  ·  started {date.today():%d %b %Y}\n\n"
+                            f"## What it is\n{brief}\n\n## Think about\n{question}\n\n"
+                            "## What I found\n- \n\n## A real example\n- \n\n## The argument against\n- \n\n"
+                            "## My view\n- \n\n## Sources\n- \n", encoding="utf-8")
+        os.startfile(path)
+
+    def topic_mark(self, topic):
+        first = not TOPIC_LOG.exists()
+        with TOPIC_LOG.open("a", encoding="utf-8") as fh:
+            if first:
+                fh.write("# day\tniche\ttopic   (topics marked as researched)\n")
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M}\t{topic[0]}\t{topic[1]}\n")
+        self.render()
+
+    def launch_claude(self, prompt, title="Claude"):
+        prompt = prompt.replace(";", ",").replace('"', "'")
+        claude = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude.exe")
+        try:
+            if shutil.which("wt"):
+                subprocess.Popen(["wt", "-d", str(HUB), claude, prompt])
+            else:
+                subprocess.Popen(["cmd", "/c", "start", "Claude", "/D", str(HUB), "cmd", "/k", claude, prompt])
+        except OSError as exc:
+            messagebox.showerror(title, f"Couldn't start Claude: {exc}")
 
     # ---------- navigation ----------
     def set_view(self, view):
@@ -1012,15 +1584,12 @@ class App:
     def toggle_theme(self):
         self.theme = "light" if self.theme == "dark" else "dark"
         self.settings["theme"] = self.theme
-        try:
-            SETTINGS.write_text(json.dumps(self.settings, indent=1), encoding="utf-8")
-        except OSError:
-            pass
+        self.save_settings()
         self.render()
 
     def show_keys(self):
         messagebox.showinfo("Keyboard shortcuts", "\n".join((
-            "1 / 2 / 3 / 4\tLesson / Dashboard / Roadmap / Notes",
+            "1 to 5\tLesson / Dashboard / Roadmap / Notes / Daily Topic",
             "Left / Right\tPrevious / next day",
             "T\tJump to today",
             "D\tMark Done",
@@ -1028,8 +1597,10 @@ class App:
             "U\tUndo",
             "L\tTeach me (opens Claude)",
             "N\tOpen notes in Notion",
-            "Space\tStart / pause the focus timer",
+            "Space\tStart / pause the timer",
+            "R\tSpin another topic (in Daily Topic)",
             "Ctrl+F or /\tSearch the roadmap (or notes, when Notes is open)",
+            "Ctrl+V\tPaste a note (in Notes)",
             "Esc\tLeave the search box")))
 
     def on_wheel(self, ev):
@@ -1038,6 +1609,13 @@ class App:
 
     def on_key(self, ev):
         k = ev.keysym.lower()
+        try:
+            if ev.widget.winfo_toplevel() is not self.root:
+                return                      # typing in another window, such as Paste a note
+        except (AttributeError, tk.TclError):
+            return
+        if isinstance(ev.widget, tk.Text) and str(ev.widget.cget("state")) == "normal":
+            return
         if isinstance(ev.widget, tk.Entry):
             if k == "escape":
                 self.root.focus_set()
@@ -1055,10 +1633,15 @@ class App:
             self.search_entry.focus_set()
             self.search_entry.select_range(0, "end")
             return "break"
+        if ev.state & 0x4 and k == "v" and self.view == "notes":
+            self.paste_note()
+            return "break"
         if ev.state & 0x4 or ev.state & 0x20000:  # leave other Ctrl / Alt combinations alone
             return
-        if k in ("1", "2", "3", "4"):
-            self.set_view(("today", "dash", "roadmap", "notes")[int(k) - 1])
+        if k in ("1", "2", "3", "4", "5"):
+            self.set_view(("today", "dash", "roadmap", "notes", "topic")[int(k) - 1])
+        elif k == "r" and self.view == "topic":
+            self.topic_spin()
         elif k in ("question", "f1"):
             self.show_keys()
         elif k == "space":
@@ -1091,6 +1674,9 @@ class App:
 
     def toggle_timer(self):
         tm = self.timer
+        if not tm["total"] and self.view == "topic":
+            self.topic_timer()
+            return
         if not tm["total"]:
             e = self.entries[self.idx]
             if not is_rest(e):
@@ -1130,7 +1716,7 @@ class App:
             self.timer_time.configure(text=clock if tm["total"] else "--:--")
             self.timer_bar.set(1 - tm["left"] / tm["total"] if tm["total"] else 0)
             name = tm["label"] + ("" if tm["running"] else "  (paused)") if tm["total"] else \
-                "Press Start timer on a lesson card, or Space."
+                "Press Start timer on a lesson or topic, or Space."
             if self.timer_name.cget("text") != name:
                 self.timer_name.configure(text=name)
         except tk.TclError:
@@ -1153,7 +1739,7 @@ class App:
                 self.root.bell()
             self.root.deiconify()
             self.root.lift()
-            messagebox.showinfo("Time's up", f"Timer finished for:\n{label}\n\nPress Done if you finished the lesson.")
+            messagebox.showinfo("Time's up", f"Timer finished for:\n{label}")
 
     # ---------- actions ----------
     def mark(self, status, e):
@@ -1181,15 +1767,7 @@ class App:
                   f"Task - {b['task']}. Done when - {b['done_when']}. "
                   "Explain in plain simple language with small steps and examples, check my understanding with "
                   "questions as we go, then quiz me at the end. Save notes per my tutoring notes rule.")
-        prompt = prompt.replace(";", ",").replace('"', "'")
-        claude = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude.exe")
-        try:
-            if shutil.which("wt"):
-                subprocess.Popen(["wt", "-d", str(HUB), claude, prompt])
-            else:
-                subprocess.Popen(["cmd", "/c", "start", "Claude", "/D", str(HUB), "cmd", "/k", claude, prompt])
-        except OSError as exc:
-            messagebox.showerror("Teach me", f"Couldn't start Claude: {exc}")
+        self.launch_claude(prompt, "Teach me")
 
     def open_notes(self, e, b):
         url = load_links().get("topics", {}).get(b.get("folder", ""))

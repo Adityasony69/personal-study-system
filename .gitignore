@@ -5,6 +5,9 @@ __pycache__/
 progress.txt
 settings.json
 notion_config.json
+topic_log.txt
+notes/research/
+notes/_trash/
 
 # separate experiment that holds a browser profile: never commit
 ums-sync/
