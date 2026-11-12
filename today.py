@@ -866,6 +866,8 @@ class App:
             side="right", padx=(0, px(8)))
         RButton(head, "Paste note", self.paste_note, T["accent"], size=9, padx=12, pady=5).pack(
             side="right", padx=(0, px(8)))
+        RButton(head, "Ask Claude", self.ask_claude_note, T["purple"], size=9, padx=12, pady=5).pack(
+            side="right", padx=(0, px(8)))
         self.note_var = tk.StringVar(value=self.note_query)
         self.search_entry = tk.Entry(head, textvariable=self.note_var, bg=T["card"], fg=T["fg"], width=24,
                                      insertbackground=T["fg"], relief="flat", font=("Segoe UI", 10),
@@ -960,6 +962,18 @@ class App:
         target = self.note_path if self.note_path and self.note_path.exists() else NOTES
         if target.exists():
             os.startfile(target)
+
+    def ask_claude_note(self):
+        """Open Claude Code in a terminal, pointed at the note that is open right now."""
+        path = self.note_path
+        if not path or not path.exists():
+            messagebox.showinfo("Ask Claude", "Open a note first, then press Ask Claude.")
+            return
+        self.launch_claude(
+            f"I am studying my note '{path.stem}' from my {path.parent.name} notes. "
+            f"Read this file first - {path} - then give me a 3 line recap of it and ask what I want - "
+            "explain a part more simply, quiz me on it, or give me a small practice task. "
+            "Use plain simple language and small steps. Do not change the file unless I ask.", "Ask Claude")
 
     def show_note(self, path):
         txt = self.note_text
