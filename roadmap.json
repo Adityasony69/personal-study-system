@@ -62,7 +62,7 @@
      "label": "How things work: What is an API?",
      "minutes": 30,
      "learn": "A menu of requests one program can make to another. REST, endpoints, request/response.",
-     "task": "Open https://api.github.com/users/Adityasony69 in your browser and read the JSON.",
+     "task": "Open https://api.github.com/users/aadityaasony in your browser and read the JSON.",
      "done_when": "You can explain API with a restaurant example.",
      "folder": "How-Things-Work"
     }
